@@ -2,8 +2,6 @@
 
 # Настройки
 DANTE_CONF_DIR="/etc/dante"
-DANTE_PROXIES_DIR="${DANTE_CONF_DIR}/proxies"
-DANTE_USERS_DB="${DANTE_CONF_DIR}/users.db"
 HTTP_PORT_START=10000
 SOCKS_PORT_START=20000
 
@@ -82,11 +80,10 @@ get_network_info() {
     # Получаем IPv4 адрес VDS
     VDS_IPV4=$(ip -4 addr show dev "$PRIMARY_INTERFACE" | grep inet | awk '{print $2}' | cut -d'/' -f1 | head -n1)
     if [ -z "$VDS_IPV4" ]; then
-            log_error "Не удалось получить IPv4 адрес VDS с интерфейса $PRIMARY_INTERFACE."
+        log_error "Не удалось получить IPv4 адрес VDS с интерфейса $PRIMARY_INTERFACE."
     fi
     log_info "IPv4 адрес VDS: $VDS_IPV4"
-
-    # Получаем все IPv6 /64 подсети на интерфейсе
+        # Получаем все IPv6 /64 подсети на интерфейсе
     ALL_IPV6_ADDRS_64=($(ip -6 addr show dev "$PRIMARY_INTERFACE" | grep inet6 | grep '/64' | awk '{print $2}'))
     if [ ${#ALL_IPV6_ADDRS_64[@]} -eq 0 ]; then
         log_error "Не найдено ни одной IPv6 /64 подсети на интерфейсе $PRIMARY_INTERFACE. Убедитесь, что ваш провайдер назначил ее."
@@ -118,65 +115,6 @@ generate_random_string() {
     head /dev/urandom | tr -dc A-Za-z0-9_ | head -c "$1"
 }
 
-configure_dante() {
-    local proxy_id=$1
-    local http_port=$2
-    local socks_port=$3
-    local proxy_username=$4
-    local proxy_password=$5
-    local generated_ipv6=$6
-
-    log_info "Настройка прокси $proxy_id (HTTP:$http_port, SOCKS5:$socks_port) с исходящим IPv6 $generated_ipv6"
-
-    # Создаем системного пользователя для аутентификации Dante
-    useradd -M -s /usr/sbin/nologin "$proxy_username" || log_error "Ошибка при создании пользователя $proxy_username."
-    echo "$proxy_username:$proxy_password" | chpasswd || log_error "Ошибка при установке пароля для пользователя $proxy_username."
-
-    # Добавляем сгенерированный IPv6 адрес на интерфейс
-    ip -6 addr add "${generated_ipv6}/64" dev "$PRIMARY_INTERFACE" || log_error "Ошибка при добавлении IPv6 $generated_ipv6 на $PRIMARY_INTERFACE."
-    log_info "IPv6 ${generated_ipv6}/64 добавлен на $PRIMARY_INTERFACE."
-
-    # Создаем файл конфигурации для данного прокси
-    cat <<EOF > "${DANTE_PROXIES_DIR}/proxy_${proxy_id}.conf"
-    # SOCKS5 Proxy ${proxy_id}
-    internal: ${VDS_IPV4} port ${socks_port}
-    external: ${PRIMARY_INTERFACE} # <-- Изменено: только интерфейс
-    socksmethod: username none
-    user.privileged: root
-    user.notprivileged: nobody
-
-    client pass {
-        from: 0.0.0.0/0 to: 0.0.0.0/0
-        log: error connect disconnect
-    }
-    socks pass {
-        from: 0.0.0.0/0 to: 0.0.0.0/0
-        log: error connect disconnect
-        socksmethod: username
-        proxy-address: ${generated_ipv6} # <-- Новая строка для SOCKS
-    }
-
-    # HTTP Proxy ${proxy_id}
-    internal: ${VDS_IPV4} port ${http_port}
-    external: ${PRIMARY_INTERFACE} # <-- Изменено: только интерфейс
-    clientmethod: username none
-    user.privileged: root
-    user.notprivileged: nobody
-
-    client pass {
-        from: 0.0.0.0/0 to: 0.0.0.0/0
-        log: error connect disconnect
-        proxy-address: ${generated_ipv6} # <-- Новая строка для HTTP
-    }
-EOF
-
-    # Открываем порты в UFW
-    ufw allow "${http_port}/tcp" comment "Dante HTTP Proxy ${proxy_id}" || log_warn "Не удалось открыть HTTP порт ${http_port} в UFW."
-    ufw allow "${socks_port}/tcp" comment "Dante SOCKS5 Proxy ${proxy_id}" || log_warn "Не удалось открыть SOCKS5 порт ${socks_port} в UFW."
-
-    log_info "Конфигурация для прокси $proxy_id создана. Порты открыты в UFW."
-}
-
 # --- Основная логика скрипта ---
 
 check_root
@@ -190,9 +128,8 @@ get_network_info
 log_info "Очистка предыдущих конфигураций Dante..."
 systemctl stop danted 2>/dev/null || true
 rm -f ${DANTE_CONF_DIR}/danted.conf
-rm -rf ${DANTE_PROXIES_DIR}
-mkdir -p ${DANTE_PROXIES_DIR}
-log_info "Старые конфиги удалены, создан каталог ${DANTE_PROXIES_DIR}."
+rm -rf ${DANTE_CONF_DIR}/proxies # Убедимся, что папка proxies удалена
+log_info "Старые конфиги удалены."
 
 # Спрашиваем количество прокси
 read -p "Сколько прокси вы хотите создать (по 1 HTTP и SOCKS5 на каждый)? " NUM_PROXIES
@@ -200,15 +137,11 @@ if ! [[ "$NUM_PROXIES" =~ ^[0-9]+$ ]] || [ "$NUM_PROXIES" -le 0 ]; then
     log_error "Некорректное количество прокси. Должно быть положительное число."
 fi
 
-# Основной danted.conf для включения всех под-конфигураций
-cat <<EOF > ${DANTE_CONF_DIR}/danted.conf
-logoutput: syslog user.info
-user.privileged: root
-user.notprivileged: nobody
-
-# Include all proxy specific configurations
-include: ${DANTE_PROXIES_DIR}/*.conf
-EOF
+# Инициализируем основную конфигурацию Dante в переменную
+DANTE_GLOBAL_CONFIG=""
+DANTE_GLOBAL_CONFIG+="logoutput: syslog user.info\n"
+DANTE_GLOBAL_CONFIG+="user.privileged: root\n"
+DANTE_GLOBAL_CONFIG+="user.notprivileged: nobody\n"
 
 # Массивы для хранения информации о прокси
 declare -a PROXY_INFO
@@ -222,7 +155,50 @@ for ((i=1; i<=$NUM_PROXIES; i++)); do
     PROXY_PASSWORD=$(generate_random_string 12)
     GENERATED_IPV6=$(generate_ipv6_addr "$IPV6_PREFIX_PART")
 
-    configure_dante "$i" "$CURRENT_HTTP_PORT" "$CURRENT_SOCKS_PORT" "$PROXY_USERNAME" "$PROXY_PASSWORD" "$GENERATED_IPV6"
+    log_info "Настройка прокси $i (HTTP:$CURRENT_HTTP_PORT, SOCKS5:$CURRENT_SOCKS_PORT) с исходящим IPv6 $GENERATED_IPV6"
+
+    # Создаем системного пользователя для аутентификации Dante
+    useradd -M -s /usr/sbin/nologin "$PROXY_USERNAME" || log_error "Ошибка при создании пользователя $PROXY_USERNAME."
+    echo "$PROXY_USERNAME:$PROXY_PASSWORD" | chpasswd || log_error "Ошибка при установке пароля для пользователя $PROXY_USERNAME."
+
+    # Добавляем сгенерированный IPv6 адрес на интерфейс
+    ip -6 addr add "${GENERATED_IPV6}/64" dev "$PRIMARY_INTERFACE" || log_error "Ошибка при добавлении IPv6 $GENERATED_IPV6 на $PRIMARY_INTERFACE."
+    log_info "IPv6 ${GENERATED_IPV6}/64 добавлен на $PRIMARY_INTERFACE."
+
+    # Добавляем конфигурацию для текущего прокси в общую переменную
+    DANTE_GLOBAL_CONFIG+="\n# SOCKS5 Proxy ${i}\n"
+    DANTE_GLOBAL_CONFIG+="internal: ${VDS_IPV4} port ${CURRENT_SOCKS_PORT}\n"
+    DANTE_GLOBAL_CONFIG+="external: ${PRIMARY_INTERFACE}\n"
+    DANTE_GLOBAL_CONFIG+="socksmethod: username\n"
+
+    DANTE_GLOBAL_CONFIG+="client pass {
+    \n"
+    DANTE_GLOBAL_CONFIG+="    from: 0.0.0.0/0 to: 0.0.0.0/0\n"
+    DANTE_GLOBAL_CONFIG+="    log: error connect disconnect\n"
+    DANTE_GLOBAL_CONFIG+="}\n"
+    DANTE_GLOBAL_CONFIG+="socks pass {\n"
+    DANTE_GLOBAL_CONFIG+="    from: 0.0.0.0/0 to: 0.0.0.0/0\n"
+    DANTE_GLOBAL_CONFIG+="    log: error connect disconnect\n"
+    DANTE_GLOBAL_CONFIG+="    socksmethod: username\n"
+    DANTE_GLOBAL_CONFIG+="    proxy-address: ${GENERATED_IPV6}\n"
+    DANTE_GLOBAL_CONFIG+="}\n"
+    
+    DANTE_GLOBAL_CONFIG+="\n# HTTP Proxy ${i}\n"
+    DANTE_GLOBAL_CONFIG+="internal: ${VDS_IPV4} port ${CURRENT_HTTP_PORT}\n"
+    DANTE_GLOBAL_CONFIG+="external: ${PRIMARY_INTERFACE}\n"
+    DANTE_GLOBAL_CONFIG+="clientmethod: username\n"
+
+    DANTE_GLOBAL_CONFIG+="client pass {\n"
+    DANTE_GLOBAL_CONFIG+="    from: 0.0.0.0/0 to: 0.0.0.0/0\n"
+    DANTE_GLOBAL_CONFIG+="    log: error connect disconnect\n"
+    DANTE_GLOBAL_CONFIG+="    proxy-address: ${GENERATED_IPV6}\n"
+    DANTE_GLOBAL_CONFIG+="}\n"
+
+    # Открываем порты в UFW
+    ufw allow "${CURRENT_HTTP_PORT}/tcp" comment "Dante HTTP Proxy ${i}" || log_warn "Не удалось открыть HTTP порт ${CURRENT_HTTP_PORT} в UFW."
+    ufw allow "${CURRENT_SOCKS_PORT}/tcp" comment "Dante SOCKS5 Proxy ${i}" || log_warn "Не удалось открыть SOCKS5 порт ${CURRENT_SOCKS_PORT} в UFW."
+
+    log_info "Конфигурация для прокси $i собрана. Порты открыты в UFW."
     
     PROXY_INFO+=("--- Proxy ${i} ---
     IPv4 VDS: ${VDS_IPV4}
@@ -233,11 +209,15 @@ for ((i=1; i<=$NUM_PROXIES; i++)); do
     Outgoing IPv6: ${GENERATED_IPV6}")
 done
 
-    log_info "Перезапуск службы Dante-server..."
-    systemctl daemon-reload
-    systemctl restart danted || log_error "Ошибка при перезапуске danted. Проверьте логи: journalctl -u danted."
-    systemctl enable danted || log_warn "Не удалось включить danted для автозапуска."
-    log_info "Служба Dante-server успешно перезапущена."
+# Записываем всю собранную конфигурацию в danted.conf
+echo -e "$DANTE_GLOBAL_CONFIG" > "${DANTE_CONF_DIR}/danted.conf" || log_error "Ошибка при записи danted.conf."
+log_info "Полный danted.conf создан."
+
+log_info "Перезапуск службы Dante-server..."
+systemctl daemon-reload
+systemctl restart danted || log_error "Ошибка при перезапуске danted. Проверьте логи: journalctl -u danted."
+systemctl enable danted || log_warn "Не удалось включить danted для автозапуска."
+log_info "Служба Dante-server успешно перезапущена."
 
 log_info "Перезагрузка правил UFW..."
 ufw reload || log_warn "Ошибка при перезагрузке UFW правил."
