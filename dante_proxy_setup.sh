@@ -1,298 +1,172 @@
 #!/bin/bash
 
-# --- НАСТРОЙКИ СКРИПТА ---
-DANTE_CONF_DIR="/etc/dante/proxies"          # Директория для хранения конфигов отдельных прокси
-DANTE_LOG_DIR="/var/log/dante"               # Директория для логов отдельных прокси
-PROXY_DETAILS_FILE="/root/socks5_proxies_details.txt" # Файл для сохранения деталей прокси
-DEFAULT_USER_PREFIX="proxyuser"
-DEFAULT_PASSWORD_LENGTH=16
-START_PORT=20000                             # Начальный порт для прокси
-GENERATED_IPV6_LIST_FILE="/var/lib/dante/generated_ipv6_addresses.txt" # Файл для отслеживания сгенерированных IPv6
+# Define color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
 
-# --- Проверка прав суперпользователя ---
+# --- Configuration for Multi-Proxy Generation ---
+PROXY_USERNAME="r4g3ng"
+PROXY_PASSWORD="admin"
+START_PORT=20000
+END_PORT=21500
+# -----------------------------------------------
+
+# Function to URL-encode username and password
+url_encode() {
+    local raw="$1"
+    local encoded=""
+    for (( i=0; i<${#raw}; i++ )); do
+        char="${raw:i:1}"
+        case "$char" in
+            [a-zA-Z0-9._~-]) encoded+="$char" ;;
+            *) encoded+=$(printf '%%%02X' "'$char") ;;
+        esac
+    done
+    echo "$encoded"
+}
+
+# Ensure the script is run as root
 if [[ $EUID -ne 0 ]]; then
-   echo "Этот скрипт должен быть запущен от имени пользователя root."
+   echo -e "${RED}Этот скрипт должен быть запущен с правами root. Используйте sudo.${NC}"
    exit 1
 fi
 
-echo "--- Инициализация: Обновление системы и установка необходимых пакетов ---"
-# Обновление списка пакетов и системы
-apt update && apt upgrade -y || { echo "Ошибка при обновлении системы. Проверьте подключение или репозитории."; exit 1; }
+echo -e "${CYAN}Начинается настройка 1500 SOCKS5 прокси...${NC}"
+echo -e "${YELLOW}Логин: ${PROXY_USERNAME}, Пароль: ${PROXY_PASSWORD}${NC}"
+echo -e "${YELLOW}Диапазон портов: ${START_PORT} - ${END_PORT}${NC}"
 
-# Установка dante-server, apache2-utils, ufw, qrencode, curl, ipv6calc
-# ipv6calc добавлен для корректной работы с IPv6 адресами.
-apt install -y dante-server apache2-utils ufw qrencode curl ipv6calc || { echo "Ошибка при установке необходимых пакетов (dante-server, ufw, ipv6calc)."; exit 1; }
-
-# --- Настройка UFW ---
-echo -e "\n--- Настройка UFW (брандмауэра) ---"
-if ! ufw status | grep -q "Status: active"; then
-    echo "UFW не активен. Включаем UFW и разрешаем SSH (порт 22)."
-    ufw enable <<< "y" # Автоматическое подтверждение
-    ufw allow 22/tcp || { echo "Ошибка при разрешении порта 22 в UFW."; exit 1; }
-    # Разрешаем UFW для loopback
-    ufw allow in on lo
-    ufw allow out on lo
-    ufw reload || { echo "Ошибка при перезагрузке UFW."; exit 1; }
-else
-    echo "UFW уже активен. Разрешаем SSH (порт 22), если еще не разрешен."
-    ufw allow 22/tcp >/dev/null 2>&1
-    ufw reload >/dev/null 2>&1
-fi
-echo "UFW настроен. Порты для прокси будут открыты автоматически."
-
-
-# --- Определение сетевого интерфейса и IP-адресов ---
-echo -e "\n--- Определение сетевого интерфейса и IP-адресов ---"
-INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5}' | head -n 1)
-if [ -z "$INTERFACE" ]; then
-    echo "Ошибка: Не удалось автоматически определить сетевой интерфейс."
-    echo "Попробуйте указать его вручную, например: export INTERFACE=eth0"
-    exit 1
-fi
-echo "Определён сетевой интерфейс: $INTERFACE"
-
-IPV4_ADDRESS=$(ip a show dev "$INTERFACE" | grep 'inet ' | grep 'global' | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
-if [ -z "$IPV4_ADDRESS" ]; then
-    echo "Ошибка: Не удалось определить публичный IPv4-адрес для интерфейса $INTERFACE."
-    echo "Проверьте сетевые настройки или наличие IPv4-адреса на интерфейсе."
-    exit 1
-fi
-echo "Определён публичный IPv4-адрес для интерфейса $INTERFACE: $IPV4_ADDRESS"
-
-# Поиск всех глобальных IPv6-подсетей /64 на интерфейсе
-IPV6_SUBNEYS_RAW=()
-mapfile -t IPV6_SUBNEYS_RAW < <(ip -6 addr show dev "$INTERFACE" | grep 'inet6 ' | grep 'global' | grep '/64' | awk '{print $2}')
-
-if [ ${#IPV6_SUBNEYS_RAW[@]} -eq 0 ]; then
-    echo "Ошибка: На интерфейсе $INTERFACE не найдено глобальных IPv6-подсетей /64."
-    echo "Проверьте конфигурацию IPv6 вашего VDS. Без /64 подсети невозможно создать исходящий IPv6-адрес."
-    exit 1
-fi
-
-# Выбираем одну случайную подсеть IPv6 /64
-SELECTED_IPV6_FULL_ADDR_WITH_MASK="${IPV6_SUBNEYS_RAW[$RANDOM % ${#IPV6_SUBNEYS_RAW[@]}]}"
-echo "Выбрана IPv6-подсеть для исходящих соединений (сырой вид): $SELECTED_IPV6_FULL_ADDR_WITH_MASK"
-
-# Извлекаем только адрес без маски
-IPV6_ADDRESS_ONLY=$(echo "$SELECTED_IPV6_FULL_ADDR_WITH_MASK" | cut -d'/' -f1)
-
-# Разворачиваем IPv6-адрес в полную форму без сокращений (без "::")
-EXPANDED_IPV6_ADDRESS=$(ipv6calc -e "$IPV6_ADDRESS_ONLY" 2>/dev/null)
-if [ -z "$EXPANDED_IPV6_ADDRESS" ]; then
-    echo "Ошибка: Не удалось развернуть IPv6-адрес '$IPV6_ADDRESS_ONLY' с помощью ipv6calc."
-    echo "Возможно, адрес некорректен или ipv6calc не работает должным образом."
-    exit 1
-fi
-echo "Развернутый (полный) IPv6-адрес выбранного префикса: $EXPANDED_IPV6_ADDRESS"
-
-# Извлекаем первые 4 гекстета (64 бита) из развернутого адреса для использования в качестве сетевой части
-IPV6_NETWORK_PART=$(echo "$EXPANDED_IPV6_ADDRESS" | cut -d':' -f1-4)
-if [ -z "$IPV6_NETWORK_PART" ] || ! echo "$IPV6_NETWORK_PART" | grep -Eq '^[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4}){3}$'; then
-    echo "Ошибка: Не удалось корректно извлечь сетевую часть IPv6-префикса из '$EXPANDED_IPV6_ADDRESS'."
-    exit 1
-fi
-echo "Определена сетевая часть IPv6 для генерации: $IPV6_NETWORK_PART"
-
-# --- Функции ---
-
-# Функция для генерации случайного IPv6-адреса (ПРАВИЛЬНАЯ ВЕРСИЯ)
-function generate_random_ipv6() {
-    local network_part="$1" # Например: "2a01:5560:1001:da6f"
-    
-    # Генерируем 4 случайных гекстета (каждый по 4 шестнадцатеричные цифры) для части хоста.
-    # Это гарантирует, что адрес будет в полном, развернутом формате, без "::".
-    local random_hextet1=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
-    local random_hextet2=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
-    local random_hextet3=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
-    local random_hextet4=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
-    
-    echo "${network_part}:${random_hextet1}:${random_hextet2}:${random_hextet3}:${random_hextet4}"
-}
-
-# Функция для генерации уникального порта (последовательно)
-current_port=$START_PORT
-function get_next_available_port() {
-    while true; do
-        if ! ss -tulnp | awk '{print $4}' | grep -q ":$current_port"; then
-            echo "$current_port"
-            current_port=$((current_port + 1))
-            return
-        fi
-        current_port=$((current_port + 1))
-        if [ "$current_port" -gt 65535 ]; then
-            echo "Ошибка: Достигнут максимальный порт (65535). Невозможно выделить новый порт." >&2
-            exit 1
-        fi
-    done
-}
-
-# --- Подготовка директорий и файлов ---
-echo -e "\n--- Подготовка директорий ---"
-mkdir -p "$DANTE_CONF_DIR" || { echo "Ошибка: Не удалось создать $DANTE_CONF_DIR."; exit 1; }
-mkdir -p "$DANTE_LOG_DIR" || { echo "Ошибка: Не удалось создать $DANTE_LOG_DIR."; exit 1; }
-mkdir -p "$(dirname "$GENERATED_IPV6_LIST_FILE")" || { echo "Ошибка: Не удалось создать директорию для $GENERATED_IPV6_LIST_FILE."; exit 1; }
-touch "$GENERATED_IPV6_LIST_FILE" || { echo "Ошибка: Не удалось создать $GENERATED_IPV6_LIST_FILE."; exit 1; }
-chmod 700 "$DANTE_CONF_DIR" "$DANTE_LOG_DIR"
-chown root:root "$DANTE_CONF_DIR" "$DANTE_LOG_DIR"
-
-echo "=============================================================" > "$PROXY_DETAILS_FILE"
-echo "Детали созданных SOCKS5 прокси (IPv4 вход, IPv6 выход):" >> "$PROXY_DETAILS_FILE"
-echo "=============================================================" >> "$PROXY_DETAILS_FILE"
-chmod 600 "$PROXY_DETAILS_FILE" # Защищаем файл с данными
-
-# --- Спрашиваем у пользователя количество прокси ---
-num_proxies=0
-while true; do
-    read -p "Сколько SOCKS5 прокси вы хотите создать? (Введите число > 0): " input_num
-    if [[ "$input_num" =~ ^[1-9][0-9]*$ ]]; then
-        num_proxies=$input_num
-        break
-    else
-        echo "Некорректный ввод. Пожалуйста, введите число больше 0."
+# Check and install danted if not present
+if ! command -v danted &> /dev/null; then
+    echo -e "${YELLOW}Dante SOCKS5 сервер не установлен. Устанавливаем...${NC}"
+    sudo apt update -y
+    sudo apt install dante-server curl -y
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}Ошибка: Не удалось установить dante-server. Проверьте подключение к интернету или репозитории.${NC}"
+        exit 1
     fi
+    echo -e "${GREEN}Dante SOCKS5 сервер установлен успешно.${NC}"
+else
+    echo -e "${GREEN}Dante SOCKS5 сервер уже установлен.${NC}"
+fi
+
+# Create the log file before starting the service
+sudo touch /var/log/danted.log
+sudo chown nobody:nogroup /var/log/danted.log
+
+# Automatically detect the primary network interface
+primary_interface=$(ip route | grep default | awk '{print $5}' | head -n 1)
+if [[ -z "$primary_interface" ]]; then
+    echo -e "${RED}Не удалось определить основной сетевой интерфейс. Пожалуйста, проверьте настройки сети.${NC}"
+    exit 1
+fi
+echo -e "${CYAN}Обнаружен основной сетевой интерфейс: ${primary_interface}${NC}"
+
+# Generate the internal port configuration lines
+PORT_CONFIG=""
+for p in $(seq "$START_PORT" "$END_PORT"); do
+    PORT_CONFIG+="internal: 0.0.0.0 port = $p"$'\n'
 done
 
-# --- Цикл создания прокси ---
-echo -e "\n--- Запуск создания прокси ---"
-for i in $(seq 1 "$num_proxies"); do
-    echo -e "\nНастройка прокси #$i из $num_proxies..."
-
-    # 1. Генерация данных
-    local_username="${DEFAULT_USER_PREFIX}$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-    local_password=$(tr -dc 'a-zA-Z0-9!@#$%^&*()_+' </dev/urandom | head -c $DEFAULT_PASSWORD_LENGTH)
-    local_port=$(get_next_available_port)
-    # Генерируем уникальный IPv6-адрес для исходящих соединений
-    generated_ipv6=$(generate_random_ipv6 "$IPV6_NETWORK_PART")
-
-    echo "  Данные для прокси #$i:"
-    echo "    Логин: $local_username"
-    echo "    Пароль: $local_password"
-    echo "    Порт: $local_port (IPv4 входящий)"
-    echo "    Исходящий IPv6: $generated_ipv6"
-
-    # 2. Добавляем сгенерированный IPv6 на интерфейс
-    echo "  Добавляем исходящий IPv6-адрес $generated_ipv6/64 на интерфейс $INTERFACE..."
-    if ! ip -6 addr add "$generated_ipv6/64" dev "$INTERFACE"; then
-        echo "Ошибка: Не удалось добавить IPv6-адрес $generated_ipv6 на интерфейс $INTERFACE."
-        echo "Прокси #$i будет пропущен."
-        continue
-    fi
-    echo "$generated_ipv6" >> "$GENERATED_IPV6_LIST_FILE" # Сохраняем для отслеживания
-
-    # 3. Создаём системного пользователя для аутентификации
-    echo "  Создаём системного пользователя '$local_username'..."
-    useradd -r -s /bin/false "$local_username" >/dev/null 2>&1
-    echo "$local_username:$local_password" | chpasswd >/dev/null 2>&1
-
-    # 4. Создаём конфигурационный файл для dante-server инстанса
-    DANTE_INSTANCE_CONF="$DANTE_CONF_DIR/danted-proxy-$i.conf"
-    DANTE_INSTANCE_LOG="$DANTE_LOG_DIR/danted-proxy-$i.log"
-    DANTE_INSTANCE_PID="/run/danted-proxy-$i.pid" # PID-файл для каждого инстанса
-
-    cat > "$DANTE_INSTANCE_CONF" <<EOL
-logoutput: stderr $DANTE_INSTANCE_LOG
-internal: 0.0.0.0 port = $local_port
-external: $generated_ipv6
-socksmethod: username
+# Create the configuration file with multiple ports
+echo -e "${CYAN}Создание конфигурационного файла /etc/danted.conf с ${END_PORT - START_PORT + 1} портами...${NC}"
+sudo bash -c "cat <<EOF > /etc/danted.conf
+logoutput: /var/log/danted.log
+# Listening ports for SOCKS5 proxy
+${PORT_CONFIG}external: $primary_interface
+method: username
 user.privileged: root
 user.notprivileged: nobody
 
 client pass {
-        from: 0.0.0.0/0 to: 0.0.0.0/0
-        log: error
+    from: 0/0 to: 0/0
+    log: connect disconnect error
 }
-
 socks pass {
-        from: 0.0.0.0/0 to: 0.0.0.0/0
-        method: username
-        protocol: tcp udp
-        log: error
+    from: 0/0 to: 0/0
+    log: connect disconnect error
 }
-EOL
-    chmod 640 "$DANTE_INSTANCE_CONF"
-    chown root:root "$DANTE_INSTANCE_CONF"
+EOF"
+if [[ $? -ne 0 ]]; then
+    echo -e "${RED}Ошибка: Не удалось создать /etc/danted.conf.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Конфигурационный файл danted.conf создан успешно.${NC}"
 
-    # 5. Создаём systemd unit файл для автозагрузки каждого прокси
-    SYSTEMD_SERVICE_FILE="/etc/systemd/system/danted-proxy-$i.service"
-    cat > "$SYSTEMD_SERVICE_FILE" <<EOL
-[Unit]
-Description=SOCKS (dante) proxy instance #$i (IPv4-in, IPv6-out)
-After=network.target network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/sbin/danted -f $DANTE_INSTANCE_CONF -p $DANTE_INSTANCE_PID
-ExecReload=/bin/kill -HUP \$MAINPID
-PIDFile=$DANTE_INSTANCE_PID
-LimitNOFILE=32768
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOL
-    chmod 644 "$SYSTEMD_SERVICE_FILE"
-
-    # 6. Открываем порт в брандмауэре
-    echo "  Открываем порт $local_port/tcp в UFW..."
-    ufw allow "$local_port"/tcp > /dev/null
-
-    # 7. Перезагружаем systemd, включаем и запускаем новый сервис
-    echo "  Перезагружаем systemd и запускаем danted-proxy-$i..."
-    systemctl daemon-reload
-    systemctl enable danted-proxy-"$i" > /dev/null
-    systemctl start danted-proxy-"$i"
-
-    if systemctl is-active --quiet danted-proxy-"$i"; then
-        echo "  Прокси #$i (danted-proxy-$i) успешно запущен."
+# Configure firewall rules for the port range
+echo -e "${CYAN}Настройка правил брандмауэра для диапазона портов ${START_PORT}:${END_PORT}...${NC}"
+if command -v ufw &> /dev/null && sudo ufw status | grep -q "Status: active"; then
+    echo -e "${YELLOW}UFW активен. Разрешаем диапазон портов ${START_PORT}:${END_PORT}/tcp...${NC}"
+    sudo ufw allow "$START_PORT:$END_PORT/tcp"
+    sudo ufw reload # Применяем изменения UFW
+elif command -v iptables &> /dev/null; then
+    echo -e "${YELLOW}UFW не активен. Настраиваем iptables для диапазона портов ${START_PORT}:${END_PORT}/tcp...${NC}"
+    # Удаляем существующие правила для этого диапазона, чтобы избежать дублирования
+    sudo iptables -D INPUT -p tcp --dport "$START_PORT:$END_PORT" -j ACCEPT 2>/dev/null
+    sudo iptables -A INPUT -p tcp --dport "$START_PORT:$END_PORT" -j ACCEPT
+    # Сохраняем правила iptables для постоянства
+    if command -v netfilter-persistent &>/dev/null; then
+        echo -e "${YELLOW}Сохраняем правила iptables с помощью netfilter-persistent...${NC}"
+        sudo netfilter-persistent save
+    elif command -v iptables-save &>/dev/null; then
+        echo -e "${YELLOW}Сохраняем правила iptables в /etc/iptables/rules.v4...${NC}"
+        # Убедимся, что директория существует
+        sudo mkdir -p /etc/iptables/
+        sudo iptables-save > /etc/iptables/rules.v4
     else
-        echo "  Ошибка: Прокси #$i (danted-proxy-$i) не удалось запустить. Проверьте логи: journalctl -u danted-proxy-$i"
-        # Попытка удалить добавленный IPv6, если сервис не запустился
-        echo "  Попытка удалить неиспользуемый IPv6 $generated_ipv6 с интерфейса $INTERFACE."
-        ip -6 addr del "$generated_ipv6/64" dev "$INTERFACE" >/dev/null 2>&1
-        sed -i "/^$generated_ipv6$/d" "$GENERATED_IPV6_LIST_FILE"
+        echo -e "${RED}Предупреждение: Не удалось найти способ сохранить правила iptables. Они могут не сохраниться после перезагрузки.${NC}"
     fi
+else
+    echo -e "${RED}Предупреждение: Ни UFW, ни iptables не найдены или не настроены. Пожалуйста, вручную откройте порты ${START_PORT}:${END_PORT} в вашем брандмауэре.${NC}"
+fi
+echo -e "${GREEN}Правила брандмауэра настроены.${NC}"
 
-    # Выводим информацию и сохраняем в файл
-    echo "============================================================="
-    echo "SOCKS5-прокси #$i установлен и запущен."
-    echo "Входящий IP: $IPV4_ADDRESS"
-    echo "Порт: $local_port"
-    echo "Логин: $local_username"
-    echo "Пароль: $local_password"
-    echo "Исходящий IPv6: $generated_ipv6"
-    echo "============================================================="
-    echo "Готовая строка для антидетект браузеров:"
-    echo "$IPV4_ADDRESS:$local_port:$local_username:$local_password"
-    echo "или $local_username:$local_password@$IPV4_ADDRESS:$local_port"
-    echo "============================================================="
+# Add or update user for SOCKS5 proxy
+echo -e "${CYAN}Создание/обновление пользователя '${PROXY_USERNAME}'...${NC}"
+if ! id "$PROXY_USERNAME" &>/dev/null; then
+    sudo useradd --shell /usr/sbin/nologin "$PROXY_USERNAME"
+    echo -e "${GREEN}Пользователь @$PROXY_USERNAME создан успешно.${NC}"
+else
+    echo -e "${YELLOW}Пользователь @$PROXY_USERNAME уже существует. Обновляем пароль.${NC}"
+fi
+echo "$PROXY_USERNAME:$PROXY_PASSWORD" | sudo chpasswd
+echo -e "${GREEN}Пароль установлен/обновлен для пользователя: ${PROXY_USERNAME}.${NC}"
 
-    echo "Прокси #$i:" >> "$PROXY_DETAILS_FILE"
-    echo "Входящий IP: $IPV4_ADDRESS" >> "$PROXY_DETAILS_FILE"
-    echo "Порт: $local_port" >> "$PROXY_DETAILS_FILE"
-    echo "Логин: $local_username" >> "$PROXY_DETAILS_FILE"
-    echo "Пароль: $local_password" >> "$PROXY_DETAILS_FILE"
-    echo "Исходящий IPv6: $generated_ipv6" >> "$PROXY_DETAILS_FILE"
-    echo "Строка (для антидетект): $local_username:$local_password@$IPV4_ADDRESS:$local_port" >> "$PROXY_DETAILS_FILE"
-    echo "Сервис Systemd: danted-proxy-$i" >> "$PROXY_DETAILS_FILE"
-    echo "-------------------------------------------------------------" >> "$PROXY_DETAILS_FILE"
+# Edit the systemd service file for danted to allow writing to log
+echo -e "${CYAN}Обновление файла службы systemd для danted...${NC}"
+SERVICE_FILE="/lib/systemd/system/danted.service"
+if ! grep -q "ReadWriteDirectories=/var/log" "$SERVICE_FILE"; then
+    sudo sed -i '/\[Service\]/a ReadWriteDirectories=/var/log' "$SERVICE_FILE"
+    echo -e "${GREEN}Добавлена директива ReadWriteDirectories=/var/log.${NC}"
+else
+    echo -e "${YELLOW}Директива ReadWriteDirectories=/var/log уже существует.${NC}"
+fi
+
+# Reload the systemd daemon and restart the service
+echo -e "${CYAN}Перезагрузка демона systemd и перезапуск службы danted...${NC}"
+sudo systemctl daemon-reload
+sudo systemctl restart danted
+sudo systemctl enable danted
+
+# Check if the service is active
+if systemctl is-active --quiet danted; then
+    echo -e "${GREEN}\nSocks5 серверы были успешно настроены и запущены на портах ${START_PORT} - ${END_PORT}.${NC}"
+else
+    echo -e "${RED}\nНе удалось запустить Socks5 сервер. Проверьте логи для получения дополнительной информации: /var/log/danted.log${NC}"
+    exit 1
+fi
+
+# Output the list of proxies
+proxy_ip=$(hostname -I | awk '{print $1}' | head -n 1)
+encoded_username=$(url_encode "$PROXY_USERNAME")
+encoded_password=$(url_encode "$PROXY_PASSWORD")
+
+echo -e "${CYAN}\nСписок всех SOCKS5 прокси:${NC}"
+echo -e "${YELLOW}----------------------------------------------------------------------${NC}"
+for p in $(seq "$START_PORT" "$END_PORT"); do
+    echo "socks5://${encoded_username}:${encoded_password}@${proxy_ip}:${p}"
 done
-
-# --- Финальные сообщения ---
-echo -e "\n============================================================="
-echo "Все $num_proxies SOCKS5-прокси успешно настроены и запущены."
-echo "Детали всех прокси сохранены в файле: $PROXY_DETAILS_FILE"
-echo "Список сгенерированных IPv6-адресов: $GENERATED_IPV6_LIST_FILE"
-echo "Прокси будут автоматически запускаться при старте сервера."
-echo "Проверьте добавленные IPv6-адреса командой: ip -6 addr show dev $INTERFACE"
-echo "============================================================="
-
-echo "Спасибо за использование скрипта! Вы можете оставить чаевые по QR-коду ниже:"
-qrencode -t ANSIUTF8 "https://pay.cloudtips.ru/p/7410814f"
-echo "Ссылка на чаевые: https://pay.cloudtips.ru/p/7410814f"
-echo "============================================================="
-echo "Рекомендуемые хостинги для VPN и прокси:"
-echo "Хостинг #1: https://vk.cc/ct29NQ (промокод off60 для 60% скидки на первый месяц)"
-echo "Хостинг #2: https://vk.cc/czDwwy (будет действовать 15% бонус в течение 24 часов!)"
-echo "============================================================="
+echo -e "${YELLOW}----------------------------------------------------------------------${NC}"
+echo -e "${GREEN}Конфигурация завершена!${NC}"
