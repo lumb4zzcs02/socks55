@@ -52,7 +52,9 @@ else
     echo -e "${GREEN}Dante SOCKS5 сервер уже установлен.${NC}"
 fi
 
-# Create the log file before starting the service
+# Create the log file before starting the service and clear any old logs
+echo -e "${CYAN}Очистка и создание файла логов /var/log/danted.log...${NC}"
+rm -f /var/log/danted.log # Удаляем старый лог, чтобы не путаться
 touch /var/log/danted.log
 chown nobody:nogroup /var/log/danted.log
 
@@ -69,7 +71,6 @@ PORT_CONFIG=""
 for p in $(seq "$START_PORT" "$END_PORT"); do
     PORT_CONFIG+="internal: 0.0.0.0 port = $p"$'\n'
 done
-
 # Calculate number of proxies for a cleaner message
 NUM_PROXIES=$((END_PORT - START_PORT + 1))
 
@@ -79,7 +80,7 @@ cat <<EOF > /etc/danted.conf
 logoutput: /var/log/danted.log
 # Listening ports for SOCKS5 proxy
 ${PORT_CONFIG}external: $primary_interface
-socksmethod: username # Changed 'method' to 'socksmethod'
+socksmethod: username # ИСПРАВЛЕНО: 'method' на 'socksmethod'
 user.privileged: root
 user.notprivileged: nobody
 
@@ -96,7 +97,7 @@ if [[ $? -ne 0 ]]; then
     echo -e "${RED}Ошибка: Не удалось создать /etc/danted.conf.${NC}"
     exit 1
 fi
-echo -e "${GREEN}Конфигурационный файл danted.conf создан успешно.${NC}"
+echo -e "${GREEN}Конфигурационный файл danted.conf создан успешно. Проверьте его содержимое командой: cat /etc/danted.conf${NC}"
 
 # Configure firewall rules for the port range
 echo -e "${CYAN}Настройка правил брандмауэра для диапазона портов ${START_PORT}:${END_PORT}...${NC}"
@@ -137,36 +138,25 @@ fi
 echo "$PROXY_USERNAME:$PROXY_PASSWORD" | chpasswd
 echo -e "${GREEN}Пароль установлен/обновлен для пользователя: ${PROXY_USERNAME}.${NC}"
 
-# Edit the systemd service file for danted to allow writing to log and set nofile limit
-echo -e "${CYAN}Обновление файла службы systemd для danted...${NC}"
-SERVICE_FILE="/lib/systemd/system/danted.service"
-# Проверяем, существует ли файл службы. В некоторых системах может быть в /etc/systemd/system/
-if [[ ! -f "$SERVICE_FILE" ]]; then
-    SERVICE_FILE="/etc/systemd/system/danted.service"
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        echo -e "${RED}Ошибка: Не найден файл службы danted.service ни в /lib/systemd/system/, ни в /etc/systemd/system/.${NC}"
-        exit 1
-    fi
-fi
+# Create systemd override file for danted to set nofile limit and ReadWriteDirectories
+echo -e "${CYAN}Создание файла переопределения Systemd для danted.service (LimitNOFILE и ReadWriteDirectories)...${NC}"
+OVERRIDE_DIR="/etc/systemd/system/danted.service.d"
+OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 
-# Добавляем или обновляем ReadWriteDirectories
-if ! grep -q "ReadWriteDirectories=/var/log" "$SERVICE_FILE"; then
-    sed -i '/\[Service\]/a ReadWriteDirectories=/var/log' "$SERVICE_FILE"
-    echo -e "${GREEN}Добавлена директива ReadWriteDirectories=/var/log.${NC}"
-else
-    echo -e "${YELLOW}Директива ReadWriteDirectories=/var/log уже существует.${NC}"
-fi
+mkdir -p "$OVERRIDE_DIR"
 
-# Добавляем или обновляем LimitNOFILE
-# Лимит должен быть больше, чем количество открываемых сокетов (1500 + несколько для служебных целей, например, 2048 или 4096)
-NOFILE_LIMIT=$((END_PORT - START_PORT + 1 + 500)) # 1500 + запас
-if grep -q "LimitNOFILE=" "$SERVICE_FILE"; then
-    sed -i "s/^LimitNOFILE=.*/LimitNOFILE=${NOFILE_LIMIT}/" "$SERVICE_FILE"
-    echo -e "${GREEN}Обновлен LimitNOFILE до ${NOFILE_LIMIT}.${NC}"
-else
-    sed -i '/\[Service\]/a LimitNOFILE='"${NOFILE_LIMIT}"'' "$SERVICE_FILE"
-    echo -e "${GREEN}Добавлен LimitNOFILE=${NOFILE_LIMIT}.${NC}"
-fi
+# Устанавливаем очень высокий лимит, чтобы гарантированно избежать "Too many open files"
+NOFILE_LIMIT=8192 
+
+cat <<EOF > "$OVERRIDE_FILE"
+[Service]
+LimitNOFILE=${NOFILE_LIMIT}
+ReadWriteDirectories=/var/log
+EOF
+
+echo -e "${GREEN}Файл переопределения Systemd создан: ${OVERRIDE_FILE}${NC}"
+echo -e "${GREEN}  - Установлен LimitNOFILE=${NOFILE_LIMIT} (максимально возможное количество открытых файлов)${NC}"
+echo -e "${GREEN}  - Добавлена ReadWriteDirectories=/var/log для разрешения записи логов.${NC}"
 
 # Reload the systemd daemon and restart the service
 echo -e "${CYAN}Перезагрузка демона systemd и перезапуск службы danted...${NC}"
@@ -177,9 +167,12 @@ systemctl enable danted
 # Check if the service is active
 if systemctl is-active --quiet danted; then
     echo -e "${GREEN}\nSocks5 серверы были успешно настроены и запущены на портах ${START_PORT} - ${END_PORT}.${NC}"
+    echo -e "${CYAN}Для проверки статуса службы: systemctl status danted${NC}"
+    echo -e "${CYAN}Для проверки лимитов открытых файлов для процесса danted: cat /proc/$(systemctl show --value -p MainPID danted 2>/dev/null)/limits | grep 'Max open files'${NC}"
 else
-    echo -e "${RED}\nНе удалось запустить Socks5 сервер. Проверьте логи для получения дополнительной информации: /var/log/danted.log${NC}"
-    echo -e "${YELLOW}Возможные причины: конфликт портов, неправильная конфигурация, или еще недостаточно увеличен лимит 'nofile'.${NC}"
+    echo -e "${RED}\nНе удалось запустить Socks5 сервер. Проверьте логи для получения дополнительной информации: tail -n 50 /var/log/danted.log${NC}"
+    echo -e "${RED}  Или полный статус: systemctl status danted${NC}"
+    echo -e "${YELLOW}  Возможные причины: конфликт портов, неверный IP-адрес интерфейса, или лимит 'nofile' всё ещё недостаточен.${NC}"
     exit 1
 fi
 
