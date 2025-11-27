@@ -187,6 +187,7 @@ get_network_info
 # Очищаем старые конфиги Dante
 log_info "Очистка предыдущих конфигураций Dante..."
 systemctl stop dante-server 2>/dev/null || true
+
 rm -f ${DANTE_CONF_DIR}/danted.conf
 rm -rf ${DANTE_PROXIES_DIR}
 mkdir -p ${DANTE_PROXIES_DIR}
