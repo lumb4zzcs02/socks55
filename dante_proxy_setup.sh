@@ -19,8 +19,7 @@ echo "--- Инициализация: Обновление системы и у�
 # Обновление списка пакетов и системы
 apt update && apt upgrade -y || { echo "Ошибка при обновлении системы. Проверьте подключение или репозитории."; exit 1; }
 
-# Установка dante-server, apache2-utils (для htpasswd, хотя здесь не используется, но было в примере), ufw, qrencode
-# qrencode и curl используются для вывода QR-кода/ссылок в конце, если они вам нужны.
+# Установка dante-server, apache2-utils, ufw, qrencode, curl
 apt install -y dante-server apache2-utils ufw qrencode curl || { echo "Ошибка при установке необходимых пакетов."; exit 1; }
 
 # --- Настройка UFW ---
@@ -50,6 +49,7 @@ if [ -z "$INTERFACE" ]; then
     exit 1
 fi
 echo "Определён сетевой интерфейс: $INTERFACE"
+
 IPV4_ADDRESS=$(ip a show dev "$INTERFACE" | grep 'inet ' | grep 'global' | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
 if [ -z "$IPV4_ADDRESS" ]; then
     echo "Ошибка: Не удалось определить публичный IPv4-адрес для интерфейса $INTERFACE."
@@ -60,29 +60,42 @@ echo "Определён публичный IPv4-адрес для интерф�
 
 # Поиск всех подсетей IPv6 /64 на интерфейсе
 IPV6_SUBNEYS=()
-mapfile -t IPV6_SUBNEYS < <(ip -6 addr show dev "$INTERFACE" | grep 'inet6 ' | grep '/64' | awk '{print $2}')
+# Ищем глобальные IPv6 адреса с маской /64
+mapfile -t IPV6_SUBNEYS < <(ip -6 addr show dev "$INTERFACE" | grep 'inet6 ' | grep 'global' | grep '/64' | awk '{print $2}')
 
 if [ ${#IPV6_SUBNEYS[@]} -eq 0 ]; then
-    echo "Ошибка: На интерфейсе $INTERFACE не найдено IPv6-подсетей /64."
+    echo "Ошибка: На интерфейсе $INTERFACE не найдено глобальных IPv6-подсетей /64."
     echo "Проверьте конфигурацию IPv6 вашего VDS. Без /64 подсети невозможно создать исходящий IPv6-адрес."
     exit 1
 fi
 
 # Выбираем одну случайную подсеть IPv6 /64
-SELECTED_IPV6_PREFIX="${IPV6_SUBNEYS[$RANDOM % ${#IPV6_SUBNEYS[@]}]}"
-# Удаляем /64 из префикса для генерации адреса
-SELECTED_IPV6_BASE_PREFIX="${SELECTED_IPV6_PREFIX%/*}" # Удаляем /64
-SELECTED_IPV6_BASE_PREFIX="${SELECTED_IPV6_BASE_PREFIX%::*}::" # Убедимся, что заканчивается на ::
-echo "Выбрана IPv6-подсеть для исходящих соединений: $SELECTED_IPV6_PREFIX"
+SELECTED_IPV6_PREFIX_WITH_MASK="${IPV6_SUBNEYS[$RANDOM % ${#IPV6_SUBNEYS[@]}]}"
+echo "Выбрана IPv6-подсеть для исходящих соединений: $SELECTED_IPV6_PREFIX_WITH_MASK"
+
+# Извлекаем только сетевую часть (первые 4 гекстета) из выбранного префикса.
+# Например, из "2a01:5560:1001:de03::1/64" получаем "2a01:5560:1001:de03"
+IPV6_NETWORK_PART=$(echo "$SELECTED_IPV6_PREFIX_WITH_MASK" | cut -d'/' -f1 | cut -d':' -f1-4)
+if [ -z "$IPV6_NETWORK_PART" ] || ! echo "$IPV6_NETWORK_PART" | grep -Eq '^[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4}){3}$'; then
+    echo "Ошибка: Не удалось корректно извлечь сетевую часть IPv6-префикса из '$SELECTED_IPV6_PREFIX_WITH_MASK'."
+    exit 1
+fi
+echo "Определена сетевая часть IPv6 для генерации: $IPV6_NETWORK_PART"
 
 # --- Функции ---
 
-# Функция для генерации случайного IPv6-адреса (правильная версия)
+# Функция для генерации случайного IPv6-адреса (ПРАВИЛЬНАЯ ВЕРСИЯ)
 function generate_random_ipv6() {
-    local base_prefix="$1"
-    # Генерируем 64 бита случайных шестнадцатеричных цифр для Host ID
-    local random_host_id=$(head /dev/urandom | tr -dc a-f0-9 | head -c 16)
-    echo "${base_prefix}${random_host_id}"
+    local network_part="$1" # Например: "2a01:5560:1001:da6f"
+    
+    # Генерируем 4 случайных гекстета (каждый по 4 шестнадцатеричные цифры) для части хоста.
+    # Это гарантирует, что адрес будет в полном, развернутом формате.
+    local random_hextet1=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
+    local random_hextet2=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
+    local random_hextet3=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
+    local random_hextet4=$(head /dev/urandom | tr -dc a-f0-9 | head -c 4)
+    
+    echo "${network_part}:${random_hextet1}:${random_hextet2}:${random_hextet3}:${random_hextet4}"
 }
 
 # Функция для генерации уникального порта (последовательно)
@@ -138,7 +151,7 @@ for i in $(seq 1 "$num_proxies"); do
     local_password=$(tr -dc 'a-zA-Z0-9!@#$%^&*()_+' </dev/urandom | head -c $DEFAULT_PASSWORD_LENGTH)
     local_port=$(get_next_available_port)
     # Генерируем уникальный IPv6-адрес для исходящих соединений
-    generated_ipv6=$(generate_random_ipv6 "$SELECTED_IPV6_BASE_PREFIX")
+    generated_ipv6=$(generate_random_ipv6 "$IPV6_NETWORK_PART")
 
     echo "  Данные для прокси #$i:"
     echo "    Логин: $local_username"
@@ -156,7 +169,6 @@ for i in $(seq 1 "$num_proxies"); do
     echo "$generated_ipv6" >> "$GENERATED_IPV6_LIST_FILE" # Сохраняем для отслеживания
 
     # 3. Создаём системного пользователя для аутентификации
-    # `-r` создает системного пользователя, `-s /bin/false` запрещает ему логиниться
     echo "  Создаём системного пользователя '$local_username'..."
     useradd -r -s /bin/false "$local_username" >/dev/null 2>&1
     echo "$local_username:$local_password" | chpasswd >/dev/null 2>&1
@@ -222,7 +234,7 @@ EOL
     systemctl start danted-proxy-"$i"
 
     if systemctl is-active --quiet danted-proxy-"$i"; then
-        echo "  Прокси #$i (danted-proxy-$i) успешно запущен."
+     echo "  Прокси #$i (danted-proxy-$i) успешно запущен."
     else
         echo "  Ошибка: Прокси #$i (danted-proxy-$i) не удалось запустить. Проверьте логи: journalctl -u danted-proxy-$i"
         # Попытка удалить добавленный IPv6, если сервис не запустился
