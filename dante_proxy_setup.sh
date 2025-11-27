@@ -182,13 +182,13 @@ for i in $(seq 1 $num_proxies); do
     DANTE_INSTANCE_LOG="$DANTE_INSTANCES_LOG_DIR/danted-proxy-${i}.log"
     DANTE_INSTANCE_PID_FILE="/run/danted-proxy-${i}.pid" # PID-файл для каждого инстанса
 
-    cat > "$DANTE_INSTANCE_CONF" <<EOL
+        cat > "$DANTE_INSTANCE_CONF" <<EOL
 logoutput: stderr $DANTE_INSTANCE_LOG
 internal: ${VDS_IPV4} port = ${local_http_port}
 internal: ${VDS_IPV4} port = ${local_socks_port}
-external: ${PRIMARY_INTERFACE}
+external: ${PRIMARY_INTERFACE} # Возвращено на eth0, так как проблема была в другом
 socksmethod: username
-clientmethod: username
+# clientmethod: username # УДАЛЕНО, чтобы избежать конфликта
 user.privileged: root
 user.notprivileged: nobody
 
@@ -196,6 +196,7 @@ user.notprivileged: nobody
 client pass {
         from: 0.0.0.0/0 to: 0.0.0.0/0
         log: error connect disconnect
+        method: username # <-- ДОБАВЛЕНО: явное указание аутентификации для HTTP
         proxy-address: ${generated_ipv6}
 }
 
