@@ -34,15 +34,15 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-echo -e "${CYAN}Начинается настройка 1500 SOCKS5 прокси...${NC}"
+echo -e "${CYAN}Начинается настройка ${END_PORT - START_PORT + 1} SOCKS5 прокси...${NC}"
 echo -e "${YELLOW}Логин: ${PROXY_USERNAME}, Пароль: ${PROXY_PASSWORD}${NC}"
 echo -e "${YELLOW}Диапазон портов: ${START_PORT} - ${END_PORT}${NC}"
 
 # Check and install danted if not present
 if ! command -v danted &> /dev/null; then
     echo -e "${YELLOW}Dante SOCKS5 сервер не установлен. Устанавливаем...${NC}"
-    sudo apt update -y
-    sudo apt install dante-server curl -y
+    apt update -y
+    apt install dante-server curl -y netfilter-persistent -y # Добавляем netfilter-persistent для сохранения iptables
     if [[ $? -ne 0 ]]; then
         echo -e "${RED}Ошибка: Не удалось установить dante-server. Проверьте подключение к интернету или репозитории.${NC}"
         exit 1
@@ -53,8 +53,8 @@ else
 fi
 
 # Create the log file before starting the service
-sudo touch /var/log/danted.log
-sudo chown nobody:nogroup /var/log/danted.log
+touch /var/log/danted.log
+chown nobody:nogroup /var/log/danted.log
 
 # Automatically detect the primary network interface
 primary_interface=$(ip route | grep default | awk '{print $5}' | head -n 1)
@@ -70,13 +70,16 @@ for p in $(seq "$START_PORT" "$END_PORT"); do
     PORT_CONFIG+="internal: 0.0.0.0 port = $p"$'\n'
 done
 
+# Calculate number of proxies for a cleaner message
+NUM_PROXIES=$((END_PORT - START_PORT + 1))
+
 # Create the configuration file with multiple ports
-echo -e "${CYAN}Создание конфигурационного файла /etc/danted.conf с ${END_PORT - START_PORT + 1} портами...${NC}"
-sudo bash -c "cat <<EOF > /etc/danted.conf
+echo -e "${CYAN}Создание конфигурационного файла /etc/danted.conf с ${NUM_PROXIES} портами...${NC}"
+cat <<EOF > /etc/danted.conf
 logoutput: /var/log/danted.log
 # Listening ports for SOCKS5 proxy
 ${PORT_CONFIG}external: $primary_interface
-method: username
+socksmethod: username # Changed 'method' to 'socksmethod'
 user.privileged: root
 user.notprivileged: nobody
 
@@ -88,7 +91,7 @@ socks pass {
     from: 0/0 to: 0/0
     log: connect disconnect error
 }
-EOF"
+EOF
 if [[ $? -ne 0 ]]; then
     echo -e "${RED}Ошибка: Не удалось создать /etc/danted.conf.${NC}"
     exit 1
@@ -97,24 +100,24 @@ echo -e "${GREEN}Конфигурационный файл danted.conf созд�
 
 # Configure firewall rules for the port range
 echo -e "${CYAN}Настройка правил брандмауэра для диапазона портов ${START_PORT}:${END_PORT}...${NC}"
-if command -v ufw &> /dev/null && sudo ufw status | grep -q "Status: active"; then
+if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
     echo -e "${YELLOW}UFW активен. Разрешаем диапазон портов ${START_PORT}:${END_PORT}/tcp...${NC}"
-    sudo ufw allow "$START_PORT:$END_PORT/tcp"
-    sudo ufw reload # Применяем изменения UFW
+    ufw allow "$START_PORT:$END_PORT/tcp"
+    ufw reload # Применяем изменения UFW
 elif command -v iptables &> /dev/null; then
     echo -e "${YELLOW}UFW не активен. Настраиваем iptables для диапазона портов ${START_PORT}:${END_PORT}/tcp...${NC}"
     # Удаляем существующие правила для этого диапазона, чтобы избежать дублирования
-    sudo iptables -D INPUT -p tcp --dport "$START_PORT:$END_PORT" -j ACCEPT 2>/dev/null
-    sudo iptables -A INPUT -p tcp --dport "$START_PORT:$END_PORT" -j ACCEPT
+    iptables -D INPUT -p tcp --dport "$START_PORT:$END_PORT" -j ACCEPT 2>/dev/null
+    iptables -A INPUT -p tcp --dport "$START_PORT:$END_PORT" -j ACCEPT
     # Сохраняем правила iptables для постоянства
     if command -v netfilter-persistent &>/dev/null; then
         echo -e "${YELLOW}Сохраняем правила iptables с помощью netfilter-persistent...${NC}"
-        sudo netfilter-persistent save
+        netfilter-persistent save
     elif command -v iptables-save &>/dev/null; then
         echo -e "${YELLOW}Сохраняем правила iptables в /etc/iptables/rules.v4...${NC}"
         # Убедимся, что директория существует
-        sudo mkdir -p /etc/iptables/
-        sudo iptables-save > /etc/iptables/rules.v4
+        mkdir -p /etc/iptables/
+        iptables-save > /etc/iptables/rules.v4
     else
         echo -e "${RED}Предупреждение: Не удалось найти способ сохранить правила iptables. Они могут не сохраниться после перезагрузки.${NC}"
     fi
@@ -126,35 +129,57 @@ echo -e "${GREEN}Правила брандмауэра настроены.${NC}"
 # Add or update user for SOCKS5 proxy
 echo -e "${CYAN}Создание/обновление пользователя '${PROXY_USERNAME}'...${NC}"
 if ! id "$PROXY_USERNAME" &>/dev/null; then
-    sudo useradd --shell /usr/sbin/nologin "$PROXY_USERNAME"
+    useradd --shell /usr/sbin/nologin "$PROXY_USERNAME"
     echo -e "${GREEN}Пользователь @$PROXY_USERNAME создан успешно.${NC}"
 else
     echo -e "${YELLOW}Пользователь @$PROXY_USERNAME уже существует. Обновляем пароль.${NC}"
 fi
-echo "$PROXY_USERNAME:$PROXY_PASSWORD" | sudo chpasswd
+echo "$PROXY_USERNAME:$PROXY_PASSWORD" | chpasswd
 echo -e "${GREEN}Пароль установлен/обновлен для пользователя: ${PROXY_USERNAME}.${NC}"
 
-# Edit the systemd service file for danted to allow writing to log
+# Edit the systemd service file for danted to allow writing to log and set nofile limit
 echo -e "${CYAN}Обновление файла службы systemd для danted...${NC}"
 SERVICE_FILE="/lib/systemd/system/danted.service"
+# Проверяем, существует ли файл службы. В некоторых системах может быть в /etc/systemd/system/
+if [[ ! -f "$SERVICE_FILE" ]]; then
+    SERVICE_FILE="/etc/systemd/system/danted.service"
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${RED}Ошибка: Не найден файл службы danted.service ни в /lib/systemd/system/, ни в /etc/systemd/system/.${NC}"
+        exit 1
+    fi
+fi
+
+# Добавляем или обновляем ReadWriteDirectories
 if ! grep -q "ReadWriteDirectories=/var/log" "$SERVICE_FILE"; then
-    sudo sed -i '/\[Service\]/a ReadWriteDirectories=/var/log' "$SERVICE_FILE"
+    sed -i '/\[Service\]/a ReadWriteDirectories=/var/log' "$SERVICE_FILE"
     echo -e "${GREEN}Добавлена директива ReadWriteDirectories=/var/log.${NC}"
 else
     echo -e "${YELLOW}Директива ReadWriteDirectories=/var/log уже существует.${NC}"
 fi
 
+# Добавляем или обновляем LimitNOFILE
+# Лимит должен быть больше, чем количество открываемых сокетов (1500 + несколько для служебных целей, например, 2048 или 4096)
+NOFILE_LIMIT=$((END_PORT - START_PORT + 1 + 500)) # 1500 + запас
+if grep -q "LimitNOFILE=" "$SERVICE_FILE"; then
+    sed -i "s/^LimitNOFILE=.*/LimitNOFILE=${NOFILE_LIMIT}/" "$SERVICE_FILE"
+    echo -e "${GREEN}Обновлен LimitNOFILE до ${NOFILE_LIMIT}.${NC}"
+else
+    sed -i '/\[Service\]/a LimitNOFILE='"${NOFILE_LIMIT}"'' "$SERVICE_FILE"
+    echo -e "${GREEN}Добавлен LimitNOFILE=${NOFILE_LIMIT}.${NC}"
+fi
+
 # Reload the systemd daemon and restart the service
 echo -e "${CYAN}Перезагрузка демона systemd и перезапуск службы danted...${NC}"
-sudo systemctl daemon-reload
-sudo systemctl restart danted
-sudo systemctl enable danted
+systemctl daemon-reload
+systemctl restart danted
+systemctl enable danted
 
 # Check if the service is active
 if systemctl is-active --quiet danted; then
     echo -e "${GREEN}\nSocks5 серверы были успешно настроены и запущены на портах ${START_PORT} - ${END_PORT}.${NC}"
 else
     echo -e "${RED}\nНе удалось запустить Socks5 сервер. Проверьте логи для получения дополнительной информации: /var/log/danted.log${NC}"
+    echo -e "${YELLOW}Возможные причины: конфликт портов, неправильная конфигурация, или еще недостаточно увеличен лимит 'nofile'.${NC}"
     exit 1
 fi
 
