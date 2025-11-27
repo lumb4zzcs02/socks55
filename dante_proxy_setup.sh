@@ -138,34 +138,36 @@ configure_dante() {
 
     # Создаем файл конфигурации для данного прокси
     cat <<EOF > "${DANTE_PROXIES_DIR}/proxy_${proxy_id}.conf"
-# SOCKS5 Proxy ${proxy_id}
-internal: ${PRIMARY_INTERFACE} port ${socks_port}
-external: ${PRIMARY_INTERFACE}:${generated_ipv6}
-socksmethod: username none
-user.privileged: root
-user.notprivileged: nobody
+    # SOCKS5 Proxy ${proxy_id}
+    internal: ${VDS_IPV4} port ${socks_port}
+    external: ${PRIMARY_INTERFACE} # <-- Изменено: только интерфейс
+    socksmethod: username none
+    user.privileged: root
+    user.notprivileged: nobody
 
-client pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error connect disconnect
-}
-socks pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error connect disconnect
-    socksmethod: username
-}
+    client pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        log: error connect disconnect
+    }
+    socks pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        log: error connect disconnect
+        socksmethod: username
+        proxy-address: ${generated_ipv6} # <-- Новая строка для SOCKS
+    }
 
-# HTTP Proxy ${proxy_id}
-internal: ${PRIMARY_INTERFACE} port ${http_port}
-external: ${PRIMARY_INTERFACE}:${generated_ipv6}
-clientmethod: username none
-user.privileged: root
-user.notprivileged: nobody
+    # HTTP Proxy ${proxy_id}
+    internal: ${VDS_IPV4} port ${http_port}
+    external: ${PRIMARY_INTERFACE} # <-- Изменено: только интерфейс
+    clientmethod: username none
+    user.privileged: root
+    user.notprivileged: nobody
 
-client pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error connect disconnect
-}
+    client pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        log: error connect disconnect
+        proxy-address: ${generated_ipv6} # <-- Новая строка для HTTP
+    }
 EOF
 
     # Открываем порты в UFW
