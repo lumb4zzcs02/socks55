@@ -19,8 +19,8 @@ This repository contains a script that helps you to setup a SOCKS5 proxy server 
 ## Installation
 Run the script
 ```bash
-wget https://raw.githubusercontent.com/lumb4zzcs02/socks55/main/socks5.sh
-sudo bash socks5.sh
+wget https://raw.githubusercontent.com/lumb4zzcs02/socks55/main/dante_proxy_setup.sh
+sudo bash dante_proxy_setup.sh
 ```
 
 You will be prompted for various options such as `reconfiguring`, `adding users`, or `uninstalling` the SOCKS5 server if it is already installed. During installation, you'll also be prompted for a `username` and `password` for the proxy authentication.
