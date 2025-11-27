@@ -11,7 +11,7 @@ NC='\033[0m' # No Color
 PROXY_USERNAME="r4g3ng"
 PROXY_PASSWORD="admin"
 START_PORT=20000
-END_PORT=21500
+END_PORT=26000 # ИЗМЕНЕНО: теперь до 26000
 # -----------------------------------------------
 
 # Function to URL-encode username and password
@@ -34,7 +34,9 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-echo -e "${CYAN}Начинается настройка ${END_PORT - START_PORT + 1} SOCKS5 прокси...${NC}"
+NUM_PROXIES=$((END_PORT - START_PORT + 1)) # Пересчитываем количество прокси
+
+echo -e "${CYAN}Начинается настройка ${NUM_PROXIES} SOCKS5 прокси...${NC}"
 echo -e "${YELLOW}Логин: ${PROXY_USERNAME}, Пароль: ${PROXY_PASSWORD}${NC}"
 echo -e "${YELLOW}Диапазон портов: ${START_PORT} - ${END_PORT}${NC}"
 
@@ -71,8 +73,6 @@ PORT_CONFIG=""
 for p in $(seq "$START_PORT" "$END_PORT"); do
     PORT_CONFIG+="internal: 0.0.0.0 port = $p"$'\n'
 done
-# Calculate number of proxies for a cleaner message
-NUM_PROXIES=$((END_PORT - START_PORT + 1))
 
 # Create the configuration file with multiple ports
 echo -e "${CYAN}Создание конфигурационного файла /etc/danted.conf с ${NUM_PROXIES} портами...${NC}"
@@ -80,7 +80,7 @@ cat <<EOF > /etc/danted.conf
 logoutput: /var/log/danted.log
 # Listening ports for SOCKS5 proxy
 ${PORT_CONFIG}external: $primary_interface
-socksmethod: username # ИСПРАВЛЕНО: 'method' на 'socksmethod'
+socksmethod: username
 user.privileged: root
 user.notprivileged: nobody
 
@@ -145,8 +145,16 @@ OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 
 mkdir -p "$OVERRIDE_DIR"
 
-# Устанавливаем очень высокий лимит, чтобы гарантированно избежать "Too many open files"
-NOFILE_LIMIT=8192 
+# Устанавливаем лимит открытых файлов, учитывая новое количество портов.
+# Количество портов (NUM_PROXIES) + запас (например, 1000)
+NOFILE_LIMIT=$((NUM_PROXIES + 1000)) 
+# Убедимся, что лимит не превышает максимальные практические значения, но достаточно для 6000+ портов.
+# Обычно Linux может поддерживать 65535, но для надежности 81920 или 131072 тоже подходят.
+# В данном случае, 7000 (6000 + 1000) будет достаточно. Если возникнут проблемы, можно еще увеличить.
+if (( NOFILE_LIMIT < 8192 )); then
+    NOFILE_LIMIT=8192 # Минимальный лимит, если портов мало
+fi
+
 
 cat <<EOF > "$OVERRIDE_FILE"
 [Service]
@@ -172,7 +180,7 @@ if systemctl is-active --quiet danted; then
 else
     echo -e "${RED}\nНе удалось запустить Socks5 сервер. Проверьте логи для получения дополнительной информации: tail -n 50 /var/log/danted.log${NC}"
     echo -e "${RED}  Или полный статус: systemctl status danted${NC}"
-    echo -e "${YELLOW}  Возможные причины: конфликт портов, неверный IP-адрес интерфейса, или лимит 'nofile' всё ещё недостаточен.${NC}"
+    echo -e "${YELLOW}  Возможные причины: конфликт портов, неверный IP-адрес интерфейса, или лимит 'nofile' всё ещё недостаточен. Попробуйте увеличить NOFILE_LIMIT еще больше.${NC}"
     exit 1
 fi
 
@@ -181,7 +189,7 @@ proxy_ip=$(hostname -I | awk '{print $1}' | head -n 1)
 encoded_username=$(url_encode "$PROXY_USERNAME")
 encoded_password=$(url_encode "$PROXY_PASSWORD")
 
-echo -e "${CYAN}\nСписок всех SOCKS5 прокси:${NC}"
+echo -e "${CYAN}\nСписок всех SOCKS5 прокси (${NUM_PROXIES} штук):${NC}"
 echo -e "${YELLOW}----------------------------------------------------------------------${NC}"
 for p in $(seq "$START_PORT" "$END_PORT"); do
     echo "socks5://${encoded_username}:${encoded_password}@${proxy_ip}:${p}"
