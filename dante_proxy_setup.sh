@@ -186,8 +186,7 @@ get_network_info
 
 # Очищаем старые конфиги Dante
 log_info "Очистка предыдущих конфигураций Dante..."
-systemctl stop dante-server 2>/dev/null || true
-
+systemctl stop danted 2>/dev/null || true
 rm -f ${DANTE_CONF_DIR}/danted.conf
 rm -rf ${DANTE_PROXIES_DIR}
 mkdir -p ${DANTE_PROXIES_DIR}
@@ -232,11 +231,11 @@ for ((i=1; i<=$NUM_PROXIES; i++)); do
     Outgoing IPv6: ${GENERATED_IPV6}")
 done
 
-log_info "Перезапуск службы Dante-server..."
-systemctl daemon-reload
-systemctl restart dante-server || log_error "Ошибка при перезапуске dante-server. Проверьте логи: journalctl -u dante-server."
-systemctl enable dante-server || log_warn "Не удалось включить dante-server для автозапуска."
-log_info "Служба Dante-server успешно перезапущена."
+    log_info "Перезапуск службы Dante-server..."
+    systemctl daemon-reload
+    systemctl restart danted || log_error "Ошибка при перезапуске danted. Проверьте логи: journalctl -u danted."
+    systemctl enable danted || log_warn "Не удалось включить danted для автозапуска."
+    log_info "Служба Dante-server успешно перезапущена."
 
 log_info "Перезагрузка правил UFW..."
 ufw reload || log_warn "Ошибка при перезагрузке UFW правил."
