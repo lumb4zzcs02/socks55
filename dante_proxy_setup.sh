@@ -14,12 +14,12 @@ show_header() {
     echo "██╔██╗ ██║██████╔╝██████╔╝██████╔╝   ██║   █████╗  ███████║██╔████╔██║"
     echo "██║╚██╗██║██╔═══╝ ██╔═══╝ ██╔══██╗   ██║   ██╔══╝  ██╔══██║██║╚██╔╝██║"
     echo "██║ ╚████║██║     ██║     ██║  ██║   ██║   ███████╗██║  ██║██║ ╚═╝ ██║"
-    echo "╚═╝  ╚═══╝╚═╝     ╚═╝     ╚═╝  ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝"
+    echo "╚═╝  ╚═══╝╚═╝     ╚═╝     ╚═╝  ╚═╝   ╚══════╝╚═╝  ╚═╝╚══╝     ╚═╝"
     echo -e "${NC}"
     echo -e "${GREEN}------------------------------------------------"
     echo "Наши контакты:"
     echo "Наш ТГ — https://t.me/nppr_team"
-    echo "Наш ВК — https://vk.com/npprteam"
+    echo "Наш ВК — https://vk.me/npprteam"
     echo "ТГ нашего магазина — https://t.me/npprteamshop"
     echo "Магазин аккаунтов, бизнес-менеджеров ФБ и Google — https://npprteam.shop"
     echo "Наш антидетект-браузер Antik Browser — https://antik-browser.com/"
@@ -331,10 +331,12 @@ bash_location="$(which bash)"
 # Get user home dir absolute path
 cd ~
 user_home_dir="$(pwd)"
-# Path to dir with all proxies info
+# Path to dir with all proxies info (still keeping this for script's own data)
 proxy_dir="$user_home_dir/proxyserver"
-# Path to file with config for backconnect proxy server
-proxyserver_config_path="$proxy_dir/3proxy/3proxy.cfg"
+# Path to file with config for backconnect proxy server (DEFAULT 3PROXY LOCATION)
+proxyserver_config_path="/etc/3proxy/3proxy.cfg"
+# Path to 3proxy executable (DEFAULT 3PROXY LOCATION)
+proxyserver_binary_path="/usr/sbin/3proxy"
 # Path to file with information about running proxy server in user-readable format
 proxyserver_info_file="$proxy_dir/running_server.info"
 # Path to file with all result (external) ipv6 addresses
@@ -353,12 +355,15 @@ last_port=$(($start_port + $proxy_count - 1));
 credentials=$(is_auth_used && [[ $use_random_auth == false ]] && echo -n ":$user:$password" || echo -n "");
 
 function is_proxyserver_installed() {
-  if [ -d $proxy_dir ] && [ "$(ls -A $proxy_dir)" ]; then return 0; fi;
+  # Check if 3proxy package is installed
+  if is_package_installed "3proxy"; then return 0; fi;
   return 1;
 }
 
 function is_proxyserver_running() {
-  if ps aux | grep -q $proxyserver_config_path; then return 0; else return 1; fi;
+  # Check if 3proxy systemd service is active
+  systemctl is-active --quiet 3proxy.service
+  return $?
 }
 
 function is_package_installed() {
@@ -370,8 +375,15 @@ function create_random_string() {
 }
 
 function kill_3proxy() {
+  # Stop the 3proxy systemd service
+  if systemctl is-active --quiet 3proxy.service; then
+    echo "Stopping 3proxy service..."
+    systemctl stop 3proxy.service &>> $script_log_file;
+  fi
+  # Fallback for any stray 3proxy processes not managed by systemd
   ps -ef | awk '/[3]proxy/{print $2}' | while read -r pid; do
-    kill $pid
+    echo "Killing stray 3proxy process $pid..."
+    kill $pid &>> $script_log_file;
   done;
 }
 
@@ -386,6 +398,7 @@ function remove_ipv6_addresses_from_iface() {
 function get_subnet_mask() {
   if [ -z $subnet_mask ]; then
     # If we parse addresses from iface and want to use lower subnets, we need to clean existing proxy from interface before parsing
+    # This block is for parsing the base IPv6 mask, so temporarily stop/remove if needed.
     if is_proxyserver_running; then kill_3proxy; fi;
     if is_proxyserver_installed; then remove_ipv6_addresses_from_iface; fi;
 
@@ -475,34 +488,24 @@ function check_ipv6() {
 function install_requred_packages() {
   apt update &>> $script_log_file;
 
-  requred_packages=("make" "g++" "wget" "curl" "cron");
+  # Adding 3proxy to this list for apt install
+  requred_packages=("make" "g++" "wget" "curl" "cron" "3proxy"); 
   for package in ${requred_packages[@]}; do install_package $package; done;
 
   echo -e "\nAll required packages installed successfully";
 }
 
 function install_3proxy() {
-
-  mkdir $proxy_dir && cd $proxy_dir
-
-  echo -e "\nDownloading proxy server source...";
-  ( # Install proxy server
-  wget https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz &> /dev/null
-  tar -xf 0.9.4.tar.gz
-  rm 0.9.4.tar.gz
-  mv 3proxy-0.9.4 3proxy) &>> $script_log_file
-  echo "Proxy server source code downloaded successfully";
-
-  echo -e "\nStart building proxy server execution file from source...";
-  # Build proxy server
-  cd 3proxy
-  make -f Makefile.Linux &>> $script_log_file;
-  if test -f "$proxy_dir/3proxy/bin/3proxy"; then
-    echo "Proxy server builded successfully"
-  else
-    log_err_and_exit "Error: proxy server build from source code failed."
+  # Instead of building from source, install from Debian repositories
+  echo -e "\nInstalling 3proxy package from apt repository...";
+  apt install 3proxy -y &>> $script_log_file;
+  if ! is_package_installed "3proxy"; then
+      log_err_and_exit "Error: cannot install 3proxy package from apt. Check if repository is configured or package name is correct.";
   fi;
-  cd ..
+  echo "3proxy installed successfully from apt.";
+
+  # Create the directory for script's own data, not for 3proxy binary/config
+  mkdir -p "$proxy_dir"
 }
 
 function configure_ipv6() {
@@ -525,7 +528,7 @@ function configure_ipv6() {
 function add_to_cron() {
   delete_file_if_exists $cron_script_path;
 
-  # Add startup script to cron (job scheduler) to restart proxy server after reboot and rotate proxy pool
+  # Add startup script to cron (job scheduler) to regenerate IPs and restart 3proxy service
   echo "@reboot $bash_location $startup_script_path" > $cron_script_path;
   if [ $rotating_interval -ne 0 ]; then echo "*/$rotating_interval * * * * $bash_location $startup_script_path" >> "$cron_script_path"; fi;
 
@@ -537,7 +540,7 @@ function add_to_cron() {
   systemctl restart cron;
 
   if crontab -l | grep -q $startup_script_path; then
-    echo "Proxy startup script added to cron autorun successfully";
+    echo "Proxy configuration and service restart script added to cron autorun successfully";
   else
     log_err "Warning: adding script to cron autorun failed.";
   fi;
@@ -571,6 +574,9 @@ function create_startup_script() {
 
   is_auth_used;
   local use_auth=$?;
+  
+  # Ensure the subnet_mask is evaluated now, not in the generated script's runtime
+  local current_subnet_mask=$(get_subnet_mask);
 
   # Add main script that runs proxy server and rotates external ip's, if server is already running
   cat > $startup_script_path <<-EOF
@@ -582,17 +588,11 @@ function create_startup_script() {
     reference="\$(echo "\$reference" | sed 's/^[[:space:]]*//')"
   }
 
-  # Save old 3proxy daemon pids, if exists
-  proxyserver_process_pids=()
-  while read -r pid; do
-    proxyserver_process_pids+=(\$pid)
-  done < <(ps -ef | awk '/[3]proxy/{print $2}');
-
   # Save old IPv6 addresses in temporary file to delete from interface after rotating
-  old_ipv6_list_file="$random_ipv6_list_file.old"
-  if test -f $random_ipv6_list_file;
-    then cp $random_ipv6_list_file \$old_ipv6_list_file;
-    rm $random_ipv6_list_file;
+  old_ipv6_list_file="${random_ipv6_list_file}.old"
+  if test -f "${random_ipv6_list_file}";
+    then cp "${random_ipv6_list_file}" "\$old_ipv6_list_file";
+    rm "${random_ipv6_list_file}";
   fi;
 
   # Array with allowed symbols in hex (in ipv6 addresses)
@@ -602,7 +602,7 @@ function create_startup_script() {
   function rh () { echo \${array[\$RANDOM%16]}; }
 
   rnd_subnet_ip () {
-    echo -n $(get_subnet_mask);
+    echo -n "$current_subnet_mask"; # Use interpolated subnet mask here
     symbol=$subnet
     while (( \$symbol < 128)); do
       if ((\$symbol % 16 == 0)); then echo -n :; fi;
@@ -618,7 +618,7 @@ function create_startup_script() {
   # Generate random 'proxy_count' ipv6 of specified subnet and write it to 'ip.list' file
   while [ "\$count" -le $proxy_count ]
   do
-    rnd_subnet_ip >> $random_ipv6_list_file;
+    rnd_subnet_ip >> "${random_ipv6_list_file}";
     ((count+=1))
   done;
 
@@ -651,37 +651,32 @@ function create_startup_script() {
   dedent auth_part;
   dedent access_rules_part;
 
-  echo "\$immutable_config_part"\$'\n'"\$auth_part"\$'\n'"\$access_rules_part"  > $proxyserver_config_path;
+  echo "\$immutable_config_part"\$'\n'"\$auth_part"\$'\n'"\$access_rules_part"  > "${proxyserver_config_path}";
 
   # Add all ipv6 backconnect proxy with random addresses in proxy server startup config
   port=$start_port
   count=0
   if [ "$proxies_type" = "http" ]; then proxy_startup_depending_on_type="proxy $mode_flag -n -a"; else proxy_startup_depending_on_type="socks $mode_flag -a"; fi;
-  if [ $use_random_auth = true ]; then readarray -t proxy_random_credentials < $random_users_list_file; fi;
-  for random_ipv6_address in \$(cat $random_ipv6_list_file); do
+  if [ $use_random_auth = true ]; then readarray -t proxy_random_credentials < "${random_users_list_file}"; fi;
+  for random_ipv6_address in \$(cat "${random_ipv6_list_file}"); do
       if [ $use_random_auth = true ]; then
         IFS=":";
         read -r username password <<< "\${proxy_random_credentials[\$count]}";
-        echo "flush" >> $proxyserver_config_path;
-        echo "users \$username:CL:\$password" >> $proxyserver_config_path;
-        echo "\$access_rules_part" >> $proxyserver_config_path;
+        echo "flush" >> "${proxyserver_config_path}";
+        echo "users \$username:CL:\$password" >> "${proxyserver_config_path}";
+        echo "\$access_rules_part" >> "${proxyserver_config_path}";
         IFS=$' \t\n';
       fi;
-      echo "\$proxy_startup_depending_on_type -p\$port -i$backconnect_ipv4 -e\$random_ipv6_address" >> $proxyserver_config_path;
+      echo "\$proxy_startup_depending_on_type -p\$port -i$backconnect_ipv4 -e\$random_ipv6_address" >> "${proxyserver_config_path}";
       ((port+=1))
       ((count+=1))
   done
 
-  # Script that adds all random ipv6 to default interface and runs backconnect proxy server
-  ulimit -n 600000
-  ulimit -u 600000
-  for ipv6_address in \$(cat ${random_ipv6_list_file}); do ip -6 addr add \$ipv6_address dev $interface_name; done;
-  ${user_home_dir}/proxyserver/3proxy/bin/3proxy ${proxyserver_config_path}
+  # Add all random ipv6 to default interface
+  for ipv6_address in \$(cat "${random_ipv6_list_file}"); do ip -6 addr add \$ipv6_address dev $interface_name; done;
 
-  # Kill old 3proxy daemon, if it's working
-  for pid in "\${proxyserver_process_pids[@]}"; do
-    kill \$pid;
-  done;
+  # Restart 3proxy service to apply new configuration and IPs
+  systemctl restart 3proxy.service
 
   # Remove old random ip list after running new 3proxy instance
   if test -f \$old_ipv6_list_file; then
@@ -739,12 +734,16 @@ function run_proxy_server() {
   if [ ! -f $startup_script_path ]; then log_err_and_exit "Error: proxy startup script doesn't exist."; fi;
 
   chmod +x $startup_script_path;
-  $bash_location $startup_script_path;
+  
+  # Execute the startup script once to generate config and restart service
+  $bash_location $startup_script_path &>> $script_log_file;
+
+  # Check if 3proxy service is running
   if is_proxyserver_running; then
     echo -e "\nIPv6 proxy server started successfully. Backconnect IPv4 is available from $backconnect_ipv4:$start_port$credentials to $backconnect_ipv4:$last_port$credentials via $proxies_type protocol";
     echo "You can copy all proxies (with credentials) in this file: $backconnect_proxies_file";
   else
-    log_err_and_exit "Error: cannot run proxy server";
+    log_err_and_exit "Error: cannot run proxy server (systemd service failed). Check logs with 'journalctl -u 3proxy'";
   fi;
 }
 
@@ -792,7 +791,7 @@ EOF
   cat >> $proxyserver_info_file <<-EOF
 Technical info:
   Subnet: /$subnet
-  Subnet mask: $subnet_mask
+  Subnet mask: $(get_subnet_mask)
   File with generated IPv6 gateway addresses: $random_ipv6_list_file
   $(if [ $rotating_interval -ne 0 ]; then echo "Rotating interval: every $rotating_interval minutes"; else echo "Rotating: disabled"; fi;)
 EOF
@@ -814,8 +813,18 @@ if [ $uninstall = true ]; then
   kill_3proxy;
   remove_ipv6_addresses_from_iface;
   close_ufw_backconnect_ports;
-  rm -rf $proxy_dir;
-  delete_file_if_exists $backconnect_proxies_file;
+  # Remove only script's own data, not the 3proxy system package
+  rm -rf "$proxy_dir"; 
+  delete_file_if_exists "$backconnect_proxies_file";
+  # Optionally remove 3proxy package itself
+  echo "Do you want to uninstall the 3proxy Debian package? (y/N)"
+  read -n 1 -r REPLY
+  if [[ "$REPLY" =~ ^[yY]$ ]]; then
+      apt purge 3proxy -y &>> $script_log_file
+      echo "3proxy Debian package uninstalled."
+  else
+      echo "3proxy Debian package kept."
+  fi
   echo -e "\nIPv6 proxy server successfully uninstalled. If you want to reinstall, just run this script again.";
   exit 0;
 fi;
@@ -851,11 +860,11 @@ delete_file_if_exists $script_log_file;
 check_startup_parameters;
 check_ipv6;
 if is_proxyserver_installed; then
-  echo -e "Proxy server already installed, reconfiguring:\n";
+  echo -e "Proxy server already installed (Debian package), reconfiguring:\n";
 else
   configure_ipv6;
   install_requred_packages;
-  install_3proxy;
+  install_3proxy; # This now installs via apt
 fi;
 backconnect_ipv4=$(get_backconnect_ipv4);
 generate_random_users_if_needed;
@@ -870,13 +879,13 @@ mv $proxy_dir/backconnect_proxies.list $proxy_dir/proxy.txt
 
 # Добавление шапки
 header="Наши контакты:\n===========================================================================\nНаш ТГ — https://t.me/nppr_team\nНаш ВК — https://vk.com/npprteam\nТГ нашего магазина — https://t.me/npprteamshop\nМагазин аккаунтов, бизнес-менеджеров ФБ и Google— https://npprteam.shop\nНаш антидетект-браузер Antik Browser — https://antik-browser.com/\n===========================================================================\n"
-echo -e $header | cat - $proxy_dir/proxy.txt > temp && mv temp $proxy_dir/proxy.txt
+echo -e "$header" | cat - $proxy_dir/proxy.txt > temp && mv temp $proxy_dir/proxy.txt
 
 # Создание архива с паролем и загрузка на file.io
 archive_password=$(openssl rand -base64 12)
 zip -P "$archive_password" $proxy_dir/proxy.zip $proxy_dir/proxy.txt
 upload_response=$(curl -F "file=@$proxy_dir/proxy.zip" https://file.io)
-upload_url=$(echo $upload_response | jq -r '.link')
+upload_url=$(echo "$upload_response" | jq -r '.link') # Используем кавычки для безопасности
 echo "Архивный пароль: $archive_password" > $proxy_dir/upload_info.txt
 echo "Ссылка для скачивания: $upload_url" >> $proxy_dir/upload_info.txt
 # Вызов функции для отображения финального сообщения
